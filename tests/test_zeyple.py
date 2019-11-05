@@ -5,7 +5,7 @@
 from __future__ import unicode_literals
 
 import unittest
-from mock import Mock
+import pytest
 import os
 import sys
 import subprocess
@@ -15,7 +15,7 @@ from six.moves.configparser import ConfigParser
 import tempfile
 from textwrap import dedent
 from io import StringIO
-from zeyple.zeyple import Zeyple, get_config_from_file_handle
+from zeyple.zeyple import Zeyple, get_config_from_file_handle, GpgManager, MissingKeyOracle, NoUsableKeyException
 
 legacy_gpg = False
 try:
@@ -53,6 +53,14 @@ def get_test_email():
         return test_file.read()
 
 
+class SmtpWrapperMock:
+    def __init__(self):
+        self.sent_messages = []
+
+    def send(self, message, recipient):
+        self.sent_messages.append(message)
+
+
 class ZeypleTest(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -60,6 +68,7 @@ class ZeypleTest(unittest.TestCase):
         self.conffile = os.path.join(self.tmpdir, 'zeyple.conf')
         self.homedir = os.path.join(self.tmpdir, 'gpg')
         self.logfile = os.path.join(self.tmpdir, 'zeyple.log')
+        self.smtp_wrapper = SmtpWrapperMock()
 
         os.mkdir(self.homedir, 0o700)
         subprocess.check_call(
@@ -67,15 +76,35 @@ class ZeypleTest(unittest.TestCase):
             stderr=open('/dev/null'),
         )
 
-    def get_zeyple(self, config_template=None):
+    def get_config(self, config_template=None):
         if config_template is None:
             config_template = DEFAULT_CONFIG_TEMPLATE
         config_text = config_template.format(self.homedir, self.logfile)
         handle = StringIO(config_text)
-        config = get_config_from_file_handle(handle)
-        zeyple = Zeyple(config)
-        zeyple._send_message = Mock()  # don't try to send emails
-        return zeyple
+        return get_config_from_file_handle(handle)
+
+    def get_zeyple(self, config_template=None):
+        self.smtp_wrapper.sent_messages = []
+        config = self.get_config(config_template)
+        return Zeyple(
+            config=config,
+            smtp_wrapper=self.smtp_wrapper,
+            gpg_manager=GpgManager(config),
+            missing_key_oracle=MissingKeyOracle(config)
+        )
+
+    def get_gpg_manager(self, config_template=None):
+        config = self.get_config(config_template)
+        return GpgManager(config)
+
+    def assert_message_count(self, count):
+        assert len(self.smtp_wrapper.sent_messages) == count
+
+    def assert_message_header(self, index, header, value):
+        assert self.smtp_wrapper.sent_messages[index][header] == value
+
+    def get_payload(self, index):
+        return self.smtp_wrapper.sent_messages[index].get_payload(decode=True).decode('utf-8')
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir)
@@ -88,7 +117,8 @@ class ZeypleTest(unittest.TestCase):
         )
         return gpg.communicate(data)[0]
 
-    def assertValidMimeMessage(self, cipher_message, mime_message):
+    def assert_valid_mime_message(self, index, orig_message):
+        cipher_message = self.smtp_wrapper.sent_messages[index]
         assert cipher_message.is_multipart()
 
         plain_payload = cipher_message.get_payload()
@@ -100,61 +130,55 @@ class ZeypleTest(unittest.TestCase):
 
         boundary = re.match(r'.+boundary="([^"]+)"', decrypted_envelope, re.MULTILINE | re.DOTALL).group(1)
         # replace auto-generated boundary with one we know
-        mime_message = mime_message.replace("BOUNDARY", boundary)
+        orig_message = orig_message.replace("BOUNDARY", boundary)
 
         prefix = dedent("""\
             Content-Type: multipart/mixed; boundary=\"""" + \
             boundary + """\"
 
             """)
-        mime_message = prefix + mime_message
+        orig_message = prefix + orig_message
 
-        assert decrypted_envelope == mime_message
+        assert decrypted_envelope == orig_message
 
     def test_user_key(self):
         """Returns the right ID for the given email address"""
 
-        zeyple = self.get_zeyple()
-        assert zeyple._user_key('non_existant@example.org') is None
+        gpg_manager = self.get_gpg_manager()
+        with pytest.raises(NoUsableKeyException):
+            gpg_manager.get_keys_for_recipient('non_existant@example.org')
 
-        user_key = zeyple._user_key(TEST1_EMAIL)
-        assert user_key == TEST1_ID
-        user_key = zeyple._user_key(TEST1_EMAIL.upper())
-        assert user_key == TEST1_ID
+        user_keys = gpg_manager.get_keys_for_recipient(TEST1_EMAIL)
+        assert len(user_keys) == 1
+        assert user_keys[0].subkeys[0].keyid == TEST1_ID
+
+        user_key = gpg_manager.get_keys_for_recipient(TEST1_EMAIL.upper())
+        assert len(user_keys) == 1
+        assert user_keys[0].subkeys[0].keyid == TEST1_ID
 
     def test_encrypt_with_plain_text(self):
         """Encrypts plain text"""
         content = 'The key is under the carpet.'.encode('ascii')
-        zeyple = self.get_zeyple()
-        encrypted = zeyple._encrypt_payload(content, [TEST1_ID])
+        gpg_manager = self.get_gpg_manager()
+        gpg_key = gpg_manager.get_key_by_id(TEST1_ID)
+        encrypted = gpg_manager.encrypt_payload(content, [gpg_key])
         assert self.decrypt(encrypted) == content
 
     def test_expired_key(self):
-        """Encrypts with expired key"""
-        content = 'The key is under the carpet.'.encode('ascii')
-        successful = None
         zeyple = self.get_zeyple()
 
-        if legacy_gpg:
-            try:
-                zeyple._encrypt_payload(content, [TEST_EXPIRED_ID])
-                successful = True
-            except gpgme.GpgmeError as error:
-                assert str(error) == 'Key with user email %s is expired!'.format(TEST_EXPIRED_EMAIL)
-        else:
-            try:
-                zeyple._encrypt_payload(content, [TEST_EXPIRED_ID])
-                successful = True
-            except gpg.errors.GPGMEError as error:
-                assert error.error == 'Key with user email %s is expired!'.format(TEST_EXPIRED_EMAIL)
+        # Expired keys are now just like missing keys
+        zeyple.process_message(get_test_email(), [TEST_EXPIRED_EMAIL])
 
-        assert successful is None
+        self.assert_message_count(1)
+        self.assert_message_header(0, 'Subject', 'Missing PGP key')
 
     def test_encrypt_binary_data(self):
         """Encrypts utf-8 characters"""
         content = b'\xc3\xa4 \xc3\xb6 \xc3\xbc'
-        zeyple = self.get_zeyple()
-        encrypted = zeyple._encrypt_payload(content, [TEST1_ID])
+        gpg_manager = self.get_gpg_manager()
+        gpg_key = gpg_manager.get_key_by_id(TEST1_ID)
+        encrypted = gpg_manager.encrypt_payload(content, [gpg_key])
         assert self.decrypt(encrypted) == content
 
     def test_process_message_with_simple_message(self):
@@ -167,7 +191,7 @@ class ZeypleTest(unittest.TestCase):
             test
             --BOUNDARY--""")
 
-        email = self.get_zeyple().process_message(dedent("""\
+        self.get_zeyple().process_message(dedent("""\
             Received: by example.org (Postfix, from userid 0)
                 id DD3B67981178; Thu,  6 Sep 2012 23:35:37 +0000 (UTC)
             To: """ + TEST1_EMAIL + """
@@ -176,9 +200,9 @@ class ZeypleTest(unittest.TestCase):
             Date: Thu,  6 Sep 2012 23:35:37 +0000 (UTC)
             From: root@example.org (root)
 
-            test""").encode('ascii'), [TEST1_EMAIL])[0]
+            test""").encode('ascii'), [TEST1_EMAIL])
 
-        self.assertValidMimeMessage(email, mime_message)
+        self.assert_valid_mime_message(0, mime_message)
 
     def test_process_message_with_unicode_message(self):
         """Encrypts unicode messages"""
@@ -191,7 +215,7 @@ class ZeypleTest(unittest.TestCase):
             ä ö ü
             --BOUNDARY--""")
 
-        email = self.get_zeyple().process_message(dedent("""\
+        self.get_zeyple().process_message(dedent("""\
             Received: by example.org (Postfix, from userid 0)
                 id DD3B67981178; Thu,  6 Sep 2012 23:35:37 +0000 (UTC)
             To: """ + TEST1_EMAIL + """
@@ -202,9 +226,9 @@ class ZeypleTest(unittest.TestCase):
             Content-Type: text/plain; charset=utf-8
             Content-Transfer-Encoding: 8bit
 
-            ä ö ü""").encode('utf-8'), [TEST1_EMAIL])[0]
+            ä ö ü""").encode('utf-8'), [TEST1_EMAIL])
 
-        self.assertValidMimeMessage(email, mime_message)
+        self.assert_valid_mime_message(0, mime_message)
 
     def test_process_message_with_multipart_message(self):
         """Encrypts multipart messages"""
@@ -229,7 +253,7 @@ class ZeypleTest(unittest.TestCase):
             Yy90ZXN0JyB3d3ctZGF0YQo=
             --BOUNDARY--""")
 
-        email = self.get_zeyple().process_message((dedent("""\
+        self.get_zeyple().process_message((dedent("""\
             Return-Path: <torvalds@linux-foundation.org>
             Received: by example.org (Postfix, from userid 0)
                 id CE9876C78258; Sat,  8 Sep 2012 13:00:18 +0000 (UTC)
@@ -242,9 +266,9 @@ class ZeypleTest(unittest.TestCase):
             Message-Id: <20120908130018.CE9876C78258@example.org>
             From: root@example.org (root)
 
-        """) + mime_message).encode('ascii'), [TEST1_EMAIL])[0]
+        """) + mime_message).encode('ascii'), [TEST1_EMAIL])
 
-        self.assertValidMimeMessage(email, mime_message)
+        self.assert_valid_mime_message(0, mime_message)
 
     def test_process_message_with_multiple_recipients(self):
         """Encrypt a message with multiple recipients"""
@@ -260,7 +284,7 @@ class ZeypleTest(unittest.TestCase):
 
             hello""").encode('ascii'), [TEST1_EMAIL, TEST2_EMAIL])
 
-        assert len(emails) == 2  # it has two recipients
+        self.assert_message_count(2)  # it has two recipients
 
     def test_process_message_with_complex_message(self):
         """Encrypts complex messages"""
@@ -272,11 +296,12 @@ class ZeypleTest(unittest.TestCase):
         contents = get_test_email()
         zeyple = self.get_zeyple(DEFAULT_CONFIG_TEMPLATE + '\nforce_encrypt = 1\n')
 
-        sent_messages = zeyple.process_message(contents, ['unknown@zeyple.example.com'])
-        assert len(sent_messages) == 0
+        zeyple.process_message(contents, ['unknown@zeyple.example.com'])
+        self.assert_message_count(0)
 
-        sent_messages = zeyple.process_message(contents, [TEST1_EMAIL])
-        assert len(sent_messages) == 1
+        zeyple.process_message(contents, [TEST1_EMAIL])
+        self.assert_message_count(1)
+        self.assert_message_header(0, 'Subject', 'Verify Email')
 
     def test_missing_key_notify(self):
         contents = get_test_email()
@@ -288,12 +313,12 @@ class ZeypleTest(unittest.TestCase):
         )
 
         sent_messages = zeyple.process_message(contents, ['unknown@zeyple.example.com'])
-        assert len(sent_messages) == 1
-        assert sent_messages[0]['Subject'] == 'Missing PGP key'
+        self.assert_message_count(1)
+        self.assert_message_header(0, 'Subject', 'Missing PGP key')
 
         sent_messages = zeyple.process_message(contents, [TEST1_EMAIL])
-        assert len(sent_messages) == 1
-        assert sent_messages[0]['Subject'] == 'Verify Email'
+        self.assert_message_count(2)
+        self.assert_message_header(1, 'Subject', 'Verify Email')
 
     def test_missing_key_drop(self):
         contents = get_test_email()
@@ -304,14 +329,14 @@ class ZeypleTest(unittest.TestCase):
             """)
         )
 
-        sent_messages = zeyple.process_message(contents, ['unknown@zeyple.example.com'])
-        assert len(sent_messages) == 0
+        zeyple.process_message(contents, ['unknown@zeyple.example.com'])
+        self.assert_message_count(0)
 
-        sent_messages = zeyple.process_message(contents, [TEST1_EMAIL])
-        assert len(sent_messages) == 1
-        assert sent_messages[0]['Subject'] == 'Verify Email'
+        zeyple.process_message(contents, [TEST1_EMAIL])
+        self.assert_message_count(1)
+        self.assert_message_header(0, 'Subject', 'Verify Email')
 
-    def test_missing_key_drop(self):
+    def test_missing_key_cleartext(self):
         contents = get_test_email()
         zeyple = self.get_zeyple(
             DEFAULT_CONFIG_TEMPLATE + dedent("""\
@@ -320,13 +345,13 @@ class ZeypleTest(unittest.TestCase):
             """)
         )
 
-        sent_messages = zeyple.process_message(contents, ['unknown@zeyple.example.com'])
-        assert len(sent_messages) == 1
-        assert sent_messages[0]['Subject'] == 'Verify Email'
+        zeyple.process_message(contents, ['unknown@zeyple.example.com'])
+        self.assert_message_count(1)
+        self.assert_message_header(0, 'Subject', 'Verify Email')
 
-        sent_messages = zeyple.process_message(contents, [TEST1_EMAIL])
-        assert len(sent_messages) == 1
-        assert sent_messages[0]['Subject'] == 'Verify Email'
+        zeyple.process_message(contents, [TEST1_EMAIL])
+        self.assert_message_count(2)
+        self.assert_message_header(0, 'Subject', 'Verify Email')
 
     def test_missing_key_complex_config(self):
         contents = get_test_email()
@@ -340,20 +365,20 @@ class ZeypleTest(unittest.TestCase):
             """)
         )
 
-        sent_messages = zeyple.process_message(contents, ['erno.testibus@example.com'])
-        assert len(sent_messages) == 1
-        assert sent_messages[0]['Subject'] == 'Verify Email'
+        zeyple.process_message(contents, ['erno.testibus@example.com'])
+        self.assert_message_count(1)
+        self.assert_message_header(0, 'Subject', 'Verify Email')
 
-        sent_messages = zeyple.process_message(contents, ['frida.testibus@example.com'])
-        assert len(sent_messages) == 1
-        assert sent_messages[0]['Subject'] == 'Missing PGP key'
+        zeyple.process_message(contents, ['frida.testibus@example.com'])
+        self.assert_message_count(2)
+        self.assert_message_header(1, 'Subject', 'Missing PGP key')
 
-        sent_messages = zeyple.process_message(contents, ['paul@example.com'])
-        assert len(sent_messages) == 0
+        zeyple.process_message(contents, ['paul@example.com'])
+        self.assert_message_count(2)
 
-        sent_messages = zeyple.process_message(contents, ['unknown@zeyple.example.com'])
-        assert len(sent_messages) == 1
-        assert sent_messages[0]['Subject'] == 'Verify Email'
+        zeyple.process_message(contents, ['unknown@zeyple.example.com'])
+        self.assert_message_count(3)
+        self.assert_message_header(2, 'Subject', 'Verify Email')
 
     def test_custom_missing_key_message(self):
         contents = get_test_email()
@@ -374,10 +399,10 @@ class ZeypleTest(unittest.TestCase):
             """).format(missing_key_message_file, subject)
         )
 
-        sent_messages = zeyple.process_message(contents, ['unknown@zeyple.example.com'])
+        zeyple.process_message(contents, ['unknown@zeyple.example.com'])
 
-        assert len(sent_messages) == 1
-        assert sent_messages[0]['Subject'] == subject
-        assert sent_messages[0]['Content-Type'] == 'text/plain; charset="utf-8"'
-        payload = sent_messages[0].get_payload(decode=True)
-        assert body in payload.decode('utf-8')
+        self.assert_message_count(1)
+        self.assert_message_header(0, 'To', 'unknown@zeyple.example.com')
+        self.assert_message_header(0, 'Subject', subject)
+        self.assert_message_header(0, 'Content-Type', 'text/plain; charset="utf-8"')
+        assert body in self.get_payload(0)
