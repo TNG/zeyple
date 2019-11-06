@@ -12,6 +12,7 @@ import smtplib
 import copy
 from io import BytesIO
 import re
+from subprocess import Popen, PIPE
 
 
 MISSING_KEY_RULES_SECTION = 'missing_key_rules'
@@ -96,8 +97,8 @@ def get_config_from_file_handle(handle):
 
     if config.has_option('zeyple', 'missing_key_notification_file'):
         file_name = config.get('zeyple', 'missing_key_notification_file')
-        with open(file_name) as handle:
-            config.missing_key_notification_body = handle.read()
+        with open(file_name) as fh:
+            config.missing_key_notification_body = fh.read()
     elif not config.has_option('zeyple', 'missing_key_notification_body'):
         config.missing_key_notification_body = \
             DEFAULT_MISSING_KEY_NOTIFICATION
@@ -207,11 +208,79 @@ class SmtpWrapper:
         logging.info("Message %s sent", message['Message-id'])
 
 
+class _GpgGroupMapper:
+    """
+    This code is heavily inspire by groups.py script found some version of
+    gpgme. Big thanks to those guys to point out the right way (and only
+    minor curses for not supporting GPG groups out-of-the-box.)
+    """
+    def __init__(self, config):
+        self._key_ids_by_group = {}
+        self._gpg_home = config.get('gpg', 'home')
+        self._key_ids_by_group = {}
+        if config is not None:
+            self.load_group_mapping()
+
+    def load_group_mapping(self):
+        logging.info('Loading groups from GPG configuration')
+        self._key_ids_by_group = {}
+        raw_data = self._get_group_data()
+        if raw_data is None:
+            logging.info('No group data found.')
+            return
+        for item in raw_data.split(','):
+            self._process_config_item(item)
+        logging.info(
+            "Loaded data for {0} groups.".format(len(self._key_ids_by_group))
+        )
+
+    def _get_group_data(self):
+        if sys.platform == "win32":
+            gpgconf_command = 'gpgconf.exe'
+        else:
+            gpgconf_command = 'gpgconf'
+        process = Popen([
+                gpgconf_command,
+                '--homedir', self._gpg_home,   # that seems not to work!
+                '--list-options', 'gpg'
+            ],
+            stdout=PIPE,
+            env={'GNUPGHOME': self._gpg_home}  # Workaround
+        )
+        raw_result = process.communicate()[0]
+        if sys.version_info[0] == 3:
+            cooked_result = raw_result.decode()
+        else:
+            cooked_result = raw_result
+        for line in cooked_result.splitlines():
+            if line.startswith("group"):
+                return line.split(":")[-1]
+        return None
+
+    def _process_config_item(self, item):
+        if item is None or item == '':
+            return
+        raw_email, key_id = item.split('=')
+        cooked_email = raw_email.lstrip('"<').rstrip('>')
+        if cooked_email not in self._key_ids_by_group:
+            self._key_ids_by_group[cooked_email] = [key_id]
+        else:
+            self._key_ids_by_group[cooked_email].append(key_id)
+
+    def exists(self, email):
+        return email in self._key_ids_by_group
+
+    def get_key_ids_for_group(self, email):
+        return self._key_ids_by_group[email]
+
+
 class GpgManager:
     def __init__(self, config):
         self._ctx = None
+        self._group_mapper = None
         if config is not None:
             self.setup(config)
+            self._group_mapper = _GpgGroupMapper(config)
 
     def setup(self, config):
         global legacy_gpg
@@ -260,6 +329,17 @@ class GpgManager:
         return out_message
 
     def get_keys_for_recipient(self, recipient):
+        if self._group_mapper.exists(recipient):
+            return [
+                self.get_key_by_id(key_id)
+                for key_id in self._group_mapper.get_key_ids_for_group(
+                    recipient
+                )
+            ]
+        else:
+            return [self._get_key_for_simple_email_address(recipient)]
+
+    def _get_key_for_simple_email_address(self, recipient):
         # Explicit matching of email and uid.email necessary.
         # Otherwise gpg.keylist will return a list of keys
         # for searches like "n"
@@ -272,7 +352,7 @@ class GpgManager:
                 if gpg_key.expired:
                     logging.info("Ignoring expired key {0}".format(key_id))
                     continue
-                return [gpg_key]
+                return gpg_key
         raise NoUsableKeyException(
             "Failed to find key for {0}".format(recipient)
         )

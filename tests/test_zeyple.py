@@ -11,7 +11,6 @@ import sys
 import subprocess
 import shutil
 import re
-from six.moves.configparser import ConfigParser
 import tempfile
 from textwrap import dedent
 from io import StringIO
@@ -29,9 +28,14 @@ TEST1_ID = 'D6513C04E24C1F83'
 TEST1_EMAIL = 'test1@zeyple.example.com'
 TEST2_ID = '0422F1C597FB1687'
 TEST2_EMAIL = 'test2@zeyple.example.com'
+TEST_GROUP = 'all@zeyple.example.com'
 TEST_EXPIRED_ID = 'ED97E21F1C7F1AC6'
 TEST_EXPIRED_EMAIL = 'test_expired@zeyple.example.com'
 
+GPG_CONF_CONTENT = """
+group <{0}>={1}
+group <{0}>={2}
+""".format(TEST_GROUP, TEST1_ID, TEST2_ID)
 
 DEFAULT_CONFIG_TEMPLATE = """
 [gpg]
@@ -53,12 +57,24 @@ def get_test_email():
         return test_file.read()
 
 
+def write_file(name, content, encoding='utf-8'):
+    if sys.version_info >= (3, 0):
+        with open(name, 'w', encoding=encoding) as out:
+            out.write(content)
+    else:
+        with open(name, 'w') as out:
+            out.write(content.encode(encoding))
+
+
 class SmtpWrapperMock:
     def __init__(self):
         self.sent_messages = []
 
     def send(self, message, recipient):
-        self.sent_messages.append(message)
+        self.sent_messages.append({
+            'message': message,
+            'envelop_to': recipient
+        })
 
 
 class ZeypleTest(unittest.TestCase):
@@ -100,11 +116,17 @@ class ZeypleTest(unittest.TestCase):
     def assert_message_count(self, count):
         assert len(self.smtp_wrapper.sent_messages) == count
 
+    def message(self, index):
+        return self.smtp_wrapper.sent_messages[index]['message']
+
     def assert_message_header(self, index, header, value):
-        assert self.smtp_wrapper.sent_messages[index][header] == value
+        assert self.message(index)[header] == value
 
     def get_payload(self, index):
-        return self.smtp_wrapper.sent_messages[index].get_payload(decode=True).decode('utf-8')
+        return self.message(index).get_payload(decode=True).decode('utf-8')
+
+    def assert_envelop_to(self, index, value):
+        assert self.smtp_wrapper.sent_messages[index]['envelop_to'] == value
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir)
@@ -118,7 +140,7 @@ class ZeypleTest(unittest.TestCase):
         return gpg.communicate(data)[0]
 
     def assert_valid_mime_message(self, index, orig_message):
-        cipher_message = self.smtp_wrapper.sent_messages[index]
+        cipher_message = self.message(index)
         assert cipher_message.is_multipart()
 
         plain_payload = cipher_message.get_payload()
@@ -284,7 +306,9 @@ class ZeypleTest(unittest.TestCase):
 
             hello""").encode('ascii'), [TEST1_EMAIL, TEST2_EMAIL])
 
-        self.assert_message_count(2)  # it has two recipients
+        self.assert_message_count(2)
+        self.assert_envelop_to(0, TEST1_EMAIL)
+        self.assert_envelop_to(1, TEST2_EMAIL)
 
     def test_process_message_with_complex_message(self):
         """Encrypts complex messages"""
@@ -385,13 +409,8 @@ class ZeypleTest(unittest.TestCase):
         missing_key_message_file = os.path.join(self.tmpdir, 'missing_key_message')
         subject = 'No key dude!'
         body = 'xxxYYYzzzäöü'
+        write_file(missing_key_message_file, body + '\n')
 
-        if sys.version_info >= (3, 0):
-            with open(missing_key_message_file, 'w', encoding='utf-8') as out:
-                out.write(body + '\n')
-        else:
-            with open(missing_key_message_file, 'w') as out:
-                out.write((body + '\n').encode('utf-8'))
         zeyple = self.get_zeyple(
             DEFAULT_CONFIG_TEMPLATE + dedent("""\
             missing_key_notification_file = {0}
@@ -406,3 +425,14 @@ class ZeypleTest(unittest.TestCase):
         self.assert_message_header(0, 'Subject', subject)
         self.assert_message_header(0, 'Content-Type', 'text/plain; charset="utf-8"')
         assert body in self.get_payload(0)
+
+    def test_groups(self):
+        contents = get_test_email()
+        write_file(self.homedir + '/gpg.conf', GPG_CONF_CONTENT)
+        zeyple = self.get_zeyple()
+
+        zeyple.process_message(contents, [TEST_GROUP])
+
+        self.assert_message_count(1)
+        self.assert_envelop_to(0, TEST_GROUP)
+        self.assert_message_header(0, 'Subject', 'Verify Email')
