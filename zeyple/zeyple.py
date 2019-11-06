@@ -446,7 +446,7 @@ class GpgManager:
             return ciphertext.getvalue()
         else:
             (ciphertext, encresult, signresult) = self._ctx.encrypt(
-                gpg_manager.Data(string=payload),
+                gpg.Data(string=payload),
                 recipients=gpg_keys,
                 sign=False,
                 always_trust=True
