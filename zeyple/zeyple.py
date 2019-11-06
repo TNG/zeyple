@@ -122,7 +122,7 @@ class Zeyple:
         self.config = config
         self._smtp_wrapper = smtp_wrapper
         self._missing_key_oracle = missing_key_oracle
-        self._gpg_wrapper = gpg_manager
+        self._gpg_manager = gpg_manager
         self.sent_messages = []
         logging.info("Zeyple ready to encrypt outgoing emails")
 
@@ -142,7 +142,7 @@ class Zeyple:
     def _process_message_for_recipient(self, in_message, recipient):
         try:
             logging.info("Recipient: %s", recipient)
-            out_message = self._gpg_wrapper.get_encryted_message(
+            out_message = self._gpg_manager.get_encryted_message(
                 in_message, recipient
             )
             self._smtp_wrapper.send(out_message, recipient)
