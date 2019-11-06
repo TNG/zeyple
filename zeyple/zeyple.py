@@ -186,10 +186,8 @@ class Zeyple:
 
 class SmtpWrapper:
     def __init__(self, config):
-        self._smtp = smtplib.SMTP(
-            config.get('relay', 'host'),
-            config.getint('relay', 'port')
-        )
+        self._relay_host = config.get('relay', 'host')
+        self._relay_port = config.getint('relay', 'port')
         if config.has_option('zeyple', 'add_header'):
             self._add_header = config.getboolean('zeyple', 'add_header')
         else:
@@ -197,14 +195,17 @@ class SmtpWrapper:
 
     def send(self, message, recipient):
         logging.info("Sending message %s", message['Message-id'])
+
         if self._add_header:
             message.add_header(
                 'X-Zeyple',
                 "processed by {0} v{1}".format(__title__, __version__)
             )
-        smtp = self._smtp
+
+        smtp = smtplib.SMTP(self._relay_host, self._relay_port)
         smtp.sendmail(message['From'], recipient, message.as_string())
         smtp.quit()
+
         logging.info("Message %s sent", message['Message-id'])
 
 
