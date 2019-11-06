@@ -48,7 +48,7 @@ except ImportError:
 
 legacy_gpg = False
 try:
-    import gpg_manager
+    import gpg
 except ImportError:
     import gpgme
     legacy_gpg = True
