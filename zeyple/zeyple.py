@@ -345,18 +345,45 @@ class GpgManager:
         # Otherwise gpg.keylist will return a list of keys
         # for searches like "n"
         for key in self._ctx.keylist(recipient):
-            for uid in key.uids:
-                if uid.email.lower() != recipient.lower():
-                    continue
-                key_id = key.subkeys[0].keyid
-                gpg_key = self.get_key_by_id(key_id)
-                if gpg_key.expired:
-                    logging.info("Ignoring expired key {0}".format(key_id))
-                    continue
-                return gpg_key
+            if not self._validate_uid(key, recipient):
+                continue
+            sub_key = self._try_to_find_valid_sub_key(key)
+            if sub_key is not None:
+                return sub_key
         raise NoUsableKeyException(
             "Failed to find key for {0}".format(recipient)
         )
+
+    def _validate_uid(self, key, recipient):
+        normalized_recipient = recipient.lower()
+        for uid in key.uids:
+            normalized_uid = uid.email.lower()
+            if normalized_recipient == normalized_uid:
+                return True
+        return False
+
+    def _try_to_find_valid_sub_key(self, key):
+        for sub_key in key.subkeys:
+            key_id = key.subkeys[0].keyid
+            gpg_key = self.get_key_by_id(key_id)
+            if gpg_key.expired:
+                logging.info("Ignoring expired key {0}".format(key_id))
+                continue
+            if gpg_key.revoked:
+                logging.info("Ignoring revoked key {0}".format(key_id))
+                continue
+            if gpg_key.invalid:
+                logging.info("Ignoring invalid key {0}".format(key_id))
+                continue
+            if not gpg_key.can_encrypt:
+                logging.info(
+                    "Ignoring key {0} not suitable for encryption".format(
+                        key_id
+                    )
+                )
+                continue
+            return gpg_key
+        return None
 
     def get_key_by_id(self, key_id):
         return self._ctx.get_key(key_id)
