@@ -341,9 +341,6 @@ class GpgManager:
             return [self._get_key_for_simple_email_address(recipient)]
 
     def _get_key_for_simple_email_address(self, recipient):
-        # Explicit matching of email and uid.email necessary.
-        # Otherwise gpg.keylist will return a list of keys
-        # for searches like "n"
         for key in self._ctx.keylist(recipient):
             if not self._validate_uid(key, recipient):
                 continue
@@ -355,6 +352,9 @@ class GpgManager:
         )
 
     def _validate_uid(self, key, recipient):
+        # Explicit matching of email and uid.email necessary.
+        # Otherwise gpg.keylist will return a list of keys
+        # for searches like "n"
         normalized_recipient = recipient.lower()
         for uid in key.uids:
             normalized_uid = uid.email.lower()
@@ -364,7 +364,7 @@ class GpgManager:
 
     def _try_to_find_valid_sub_key(self, key):
         for sub_key in key.subkeys:
-            key_id = key.subkeys[0].keyid
+            key_id = sub_key.keyid
             gpg_key = self.get_key_by_id(key_id)
             if gpg_key.expired:
                 logging.info("Ignoring expired key {0}".format(key_id))
