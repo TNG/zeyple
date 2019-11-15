@@ -341,22 +341,57 @@ class GpgManager:
             return [self._get_key_for_simple_email_address(recipient)]
 
     def _get_key_for_simple_email_address(self, recipient):
-        # Explicit matching of email and uid.email necessary.
-        # Otherwise gpg.keylist will return a list of keys
-        # for searches like "n"
         for key in self._ctx.keylist(recipient):
-            for uid in key.uids:
-                if uid.email.lower() != recipient.lower():
-                    continue
-                key_id = key.subkeys[0].keyid
-                gpg_key = self.get_key_by_id(key_id)
-                if gpg_key.expired:
-                    logging.info("Ignoring expired key {0}".format(key_id))
-                    continue
-                return gpg_key
+            if self._validate_key(key, recipient):
+                return key
         raise NoUsableKeyException(
             "Failed to find key for {0}".format(recipient)
         )
+
+    def _validate_key(self, key, recipient):
+        key = self.get_key_by_id(key.subkeys[0].keyid)
+        if not self._validate_uid(key, recipient):
+            return False
+        if not self._validate_key_part(key, recipient):
+            return False
+        for sub_key in key.subkeys:
+            if self._validate_key_part(sub_key, recipient):
+                return True
+        return False
+
+    def _validate_uid(self, key, recipient):
+        # Explicit matching of email and uid.email necessary.
+        # Otherwise gpg.keylist will return a list of keys
+        # for searches like "n"
+        normalized_recipient = recipient.lower()
+        for uid in key.uids:
+            normalized_uid = uid.email.lower()
+            if normalized_recipient == normalized_uid:
+                return True
+        return False
+
+    def _validate_key_part(self, key_part, recipient):
+        if hasattr(key_part, 'keyid'):
+            key_description = "{0} of {1}".format(key_part.keyid, recipient)
+        else:
+            key_description = "for {0}".format(recipient)
+        if key_part.expired:
+            logging.info("Ignoring expired key {0}".format(key_description))
+            return False
+        if key_part.revoked:
+            logging.info("Ignoring revoked key {0}".format(key_description))
+            return False
+        if key_part.invalid:
+            logging.info("Ignoring invalid key {0}".format(key_description))
+            return False
+        if not key_part.can_encrypt:
+            logging.info(
+                "Ignoring key {0} not suitable for encryption".format(
+                    key_description
+                )
+            )
+            return False
+        return True
 
     def get_key_by_id(self, key_id):
         return self._ctx.get_key(key_id)

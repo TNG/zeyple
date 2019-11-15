@@ -31,6 +31,7 @@ TEST2_EMAIL = 'test2@zeyple.example.com'
 TEST_GROUP = 'all@zeyple.example.com'
 TEST_EXPIRED_ID = 'ED97E21F1C7F1AC6'
 TEST_EXPIRED_EMAIL = 'test_expired@zeyple.example.com'
+ERNO_VALID_SUBKEY_ID = '9349176209663454'
 
 GPG_CONF_CONTENT = """
 group <{0}>={1}
@@ -177,6 +178,17 @@ class ZeypleTest(unittest.TestCase):
         user_key = gpg_manager.get_keys_for_recipient(TEST1_EMAIL.upper())
         assert len(user_keys) == 1
         assert user_keys[0].subkeys[0].keyid == TEST1_ID
+
+    def test_user_subkeys(self):
+        """Returns only keys with valid subkeys"""
+
+        gpg_manager = self.get_gpg_manager()
+        with pytest.raises(NoUsableKeyException):
+            gpg_manager.get_keys_for_recipient('erno.subkey@example.com')
+
+        user_keys = gpg_manager.get_keys_for_recipient('erno.valid_subkey@example.com')
+        assert len(user_keys) == 1
+        assert user_keys[0].subkeys[0].keyid == ERNO_VALID_SUBKEY_ID
 
     def test_encrypt_with_plain_text(self):
         """Encrypts plain text"""
