@@ -149,9 +149,9 @@ class ZeypleTest(unittest.TestCase):
         assert encrypted_envelope["Content-Type"] == 'application/octet-stream; name="encrypted.asc"'
 
         encrypted_payload = encrypted_envelope.get_payload().encode('utf-8')
-        decrypted_envelope = self.decrypt(encrypted_payload).decode('utf-8').strip()
+        decrypted_payload = self.decrypt(encrypted_payload).decode('utf-8').strip()
 
-        boundary = re.match(r'.+boundary="([^"]+)"', decrypted_envelope, re.MULTILINE | re.DOTALL).group(1)
+        boundary = re.match(r'.+boundary="([^"]+)"', decrypted_payload, re.MULTILINE | re.DOTALL).group(1)
         # replace auto-generated boundary with one we know
         orig_message = orig_message.replace("BOUNDARY", boundary)
 
@@ -162,7 +162,7 @@ class ZeypleTest(unittest.TestCase):
             """)
         orig_message = prefix + orig_message
 
-        assert decrypted_envelope == orig_message
+        assert decrypted_payload == orig_message
 
     def test_user_key(self):
         """Returns the right ID for the given email address"""
@@ -292,7 +292,7 @@ class ZeypleTest(unittest.TestCase):
             Received: by example.org (Postfix, from userid 0)
                 id CE9876C78258; Sat,  8 Sep 2012 13:00:18 +0000 (UTC)
             Date: Sat, 08 Sep 2012 13:00:18 +0000
-            To: """ + TEST1_EMAIL + """
+            To: """ + TEST1_EMAIL + ', ' + TEST2_EMAIL + """
             Subject: test
             User-Agent: Heirloom mailx 12.4 7/29/08
             MIME-Version: 1.0
@@ -300,9 +300,10 @@ class ZeypleTest(unittest.TestCase):
             Message-Id: <20120908130018.CE9876C78258@example.org>
             From: root@example.org (root)
 
-        """) + mime_message).encode('ascii'), [TEST1_EMAIL])
+        """) + mime_message).encode('ascii'), [TEST1_EMAIL, TEST2_EMAIL])
 
         self.assert_valid_mime_message(0, mime_message)
+        self.assert_valid_mime_message(1, mime_message)
 
     def test_process_message_with_multiple_recipients(self):
         """Encrypt a message with multiple recipients"""
