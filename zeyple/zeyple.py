@@ -9,7 +9,7 @@ import email.mime.application
 from email.mime.text import MIMEText
 import email.encoders
 import smtplib
-import copy
+from copy import deepcopy
 from io import BytesIO
 import re
 from subprocess import Popen, PIPE
@@ -157,7 +157,7 @@ class Zeyple:
             logging.warning(
                 "{0}, message will be sent unencrypted".format(message)
             )
-            self._smtp_wrapper.send(copy.copy(in_message), recipient)
+            self._smtp_wrapper.send(deepcopy(in_message), recipient)
         else:
             logging.warning(
                 "{0}, sending notification to recipient".format(message),
@@ -312,7 +312,7 @@ class GpgManager:
         version = self._get_version_part()
         encrypted = self._get_encrypted_part(encrypted_payload)
 
-        out_message = copy.copy(in_message)
+        out_message = deepcopy(in_message)
         out_message.preamble = "This is an OpenPGP/MIME encrypted " \
                                "message (RFC 4880 and 3156)"
 
