@@ -13,6 +13,7 @@ fpm -f -s dir -t "$TYPE" -n zeyple \
     --version "$(grep -E "^__version__ = '(.+)'$" ../zeyple/zeyple.py | cut -d\' -f2)" \
     --after-install after-install.sh \
     --before-remove before-remove.sh \
+    --after-purge after-purge.sh \
     --depends gnupg \
     --depends "python-gpgme | python-gpg" \
     --depends "python-gpgme | libgpgme-dev" \
